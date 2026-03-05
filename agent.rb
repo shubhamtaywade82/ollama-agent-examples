@@ -28,10 +28,7 @@ MAX_STEPS = 20
 
 # System prompt for the executor phase
 AGENT_SYSTEM_PROMPT = <<~PROMPT
-  You are an AI assistant that can use tools.
-  - ONLY use a tool if it is strictly necessary to answer the user's request.
-  - If the user is just saying "HI" or asking a general question you can answer directly, do NOT call any tools.
-  - Provide results clearly and concisely. Do not add meta-commentary about tool selection unless necessary.
+  You are an AI assistant that can use tools to achieve the user's goal.
 PROMPT
 
 # client = Ollama::Client.new (Moved to top)
@@ -173,31 +170,40 @@ PLAN_SCHEMA = {
 # Planner
 # ---------------------------
 
-def plan_next_step(client, messages, model: PLANNER_MODEL)
-  planner_messages = messages.dup
+def plan_next_step(client, goal, observations, model: PLANNER_MODEL)
+  observation_text = observations.map.with_index do |obs, i|
+    "Step #{i + 1}: #{obs}"
+  end.join("\n")
 
-  planner_messages << {
-    role: 'system',
-    content: <<~PROMPT
-      You are an AI planning agent. Decide the next action based on the conversation history.
+  prompt = <<~PROMPT
+    You are an autonomous AI agent.
 
-      Available Actions:
-      - tool: Use this if you need more information or to perform a calculation.
-      - respond: Use this to provide a verbal reply to the user.
-      - finish: Use this ONLY if you have JUST SENT the final answer to the user in a 'respond' action.
+    Goal:
+    #{goal}
 
-      Available Tools & Parameters:
-      - read_file: { path: "string" }
-      - list_files: { path: "string" }
-      - calculate: { expression: "string" }
+    Observations so far:
+    #{observation_text}
 
-      CRITICAL:
-      CRITICAL:
-      1. If you just received a 'tool' result, you MUST choose 'respond' to verbalize the answer.
-      2. ONLY use 'finish' if the assistant has JUST SENT the final answer in a 'respond' action.
-      3. For any initial request, NEVER choose 'finish' immediately.
-    PROMPT
-  }
+    Decide the next action.
+
+    Available actions (MUST CHOOSE EXACTLY ONE):
+    - tool: call a tool to gather data or process math.
+    - respond: answer the user verbally with your final answer.
+    - finish: goal achieved AND the user has already received the answer.
+
+    Tool Parameters (STRICT JSON ONLY):
+    - read_file requires EXACTLY { "path": "filename" }. Do NOT use "file_path".
+    - list_files requires EXACTLY { "path": "dirname" }.
+    - calculate requires EXACTLY { "expression": "ruby math expression" } (e.g. "(10+20)/2").
+
+    Rules:
+    1. If the last observation is a tool result, you MUST choose 'respond' to verbalize the result to the user.
+    2. If the last observation is an 'assistant' response that provides the final answer, you MUST choose 'finish'.
+    3. Do NOT include tool_name or tool_arguments if your action is 'respond' or 'finish'.
+    4. If a tool failed previously with an ArgumentError, correct your parameter names (e.g. use "path", not "file_path").
+  PROMPT
+
+  planner_messages = [{ role: 'user', content: prompt }]
 
   options = {
     messages: planner_messages,
@@ -237,19 +243,23 @@ def run_tool(tool_name, args)
 
   return { error: "Unknown tool #{tool_name}" } unless tool
 
-  tool.call(**args.transform_keys(&:to_sym))
+  begin
+    tool.call(**args.transform_keys(&:to_sym))
+  rescue => e
+    { error: "#{e.class}: #{e.message}" }
+  end
 end
 
 # ---------------------------
 # Chat Executor
 # ---------------------------
 
-def execute_chat(client, messages, model: EXECUTOR_MODEL)
-  pp messages
+def execute_chat(client, messages, model: EXECUTOR_MODEL, allow_tools: true)
   options = {
-    messages: messages,
-    tools: TOOL_SCHEMAS
+    messages: messages
   }
+
+  options[:tools] = TOOL_SCHEMAS if allow_tools
 
   options[:think] = true if thinking_capable?(model)
 
@@ -269,9 +279,12 @@ end
 # ---------------------------
 
 def run_agent(client, user_input)
+  goal = user_input
+  observations = []
+
   messages = [
     { role: 'system', content: AGENT_SYSTEM_PROMPT },
-    { role: 'user', content: user_input }
+    { role: 'user', content: goal }
   ]
 
   step = 0
@@ -285,7 +298,7 @@ def run_agent(client, user_input)
     puts "STEP #{step}"
     puts '----------------------------'
 
-    plan_response = plan_next_step(client, messages, model: PLANNER_MODEL)
+    plan_response = plan_next_step(client, goal, observations, model: PLANNER_MODEL)
 
     puts "\n[THINKING]"
     if plan_response[:reasoning]
@@ -314,15 +327,36 @@ def run_agent(client, user_input)
       puts "\n[TOOL RESULT]"
       puts result
 
+      observations << {
+        tool: tool_name,
+        args: args,
+        result: result
+      }
+
+      call_id = "call_p#{step}"
+      messages << {
+        role: 'assistant',
+        tool_calls: [
+          {
+            id: call_id,
+            type: 'function',
+            function: {
+              name: tool_name,
+              arguments: args
+            }
+          }
+        ]
+      }
+
       messages << {
         role: 'tool',
-        tool_name: tool_name,
+        name: tool_name,
         content: result.to_json
       }
 
     when 'respond'
 
-      response = execute_chat(client, messages, model: EXECUTOR_MODEL)
+      response = execute_chat(client, messages, model: EXECUTOR_MODEL, allow_tools: false)
 
       if response[:type] == :tool_call
 
@@ -345,6 +379,12 @@ def run_agent(client, user_input)
           puts "\n[TOOL RESULT]"
           puts result
 
+          observations << {
+            tool: name,
+            args: args,
+            result: result
+          }
+
           messages << {
             role: 'tool',
             tool_name: name,
@@ -361,6 +401,10 @@ def run_agent(client, user_input)
           puts "\n[FINISHED] (No new information from executor)"
           break
         else
+          observations << {
+            assistant: response[:content]
+          }
+
           messages << {
             role: 'assistant',
             content: response[:content]
