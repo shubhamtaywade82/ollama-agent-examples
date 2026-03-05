@@ -160,7 +160,11 @@ PLAN_SCHEMA = {
       'enum' => %w[read_file list_files calculate]
     },
     'tool_arguments' => {
-      'type' => 'object'
+      'type' => 'object',
+      'properties' => {
+        'path' => { 'type' => 'string' },
+        'expression' => { 'type' => 'string' }
+      }
     }
   }
 }.freeze
@@ -188,9 +192,10 @@ def plan_next_step(client, messages, model: PLANNER_MODEL)
       - calculate: { expression: "string" }
 
       CRITICAL:
-      1. If the user's request is NOT yet answered, you MUST choose 'tool' or 'respond'.
-      2. ONLY use 'finish' if the final answer is already in the history.
-      3. For "hi", choose 'respond' for step 1.
+      CRITICAL:
+      1. If you just received a 'tool' result, you MUST choose 'respond' to verbalize the answer.
+      2. ONLY use 'finish' if the assistant has JUST SENT the final answer in a 'respond' action.
+      3. For any initial request, NEVER choose 'finish' immediately.
     PROMPT
   }
 
