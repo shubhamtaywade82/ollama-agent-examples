@@ -8,20 +8,25 @@ require 'json'
 # Configuration
 # ---------------------------
 
-client = Ollama::Client.new
+# Configure Ollama Client with specific timeout
+config = Ollama::Config.new
+config.timeout = 120 # Increase timeout to 120s for long thinking/processing
+client = Ollama::Client.new(config: config)
 
 # Discover thinking-capable models efficiently
 available_models = client.list_models
 THINKING_MODELS = available_models.select { |m| m.dig('capabilities', 'thinking') == true }
 
 # Separate by size/preference
-# Prefer qwen3:0.6b for planning if available, otherwise the smallest thinking model
+# Prefer qwen3:8b or similar medium model for planning if available
 sorted_thinking = THINKING_MODELS.sort_by { |m| m['size'] || 0 }
-planner_match = sorted_thinking.find { |m| m['model'].include?('0.6b') } || sorted_thinking.first
+planner_match = sorted_thinking.find { |m| m['model'].include?('8b') } ||
+                sorted_thinking.find { |m| m['model'].include?('latest') } ||
+                sorted_thinking.first
 
-PLANNER_MODEL = planner_match ? planner_match['model'] : 'qwen3:0.6b'
+PLANNER_MODEL = planner_match ? planner_match['model'] : 'qwen3:8b'
 # Prefer a larger model for execution
-EXECUTOR_MODEL = sorted_thinking.last ? sorted_thinking.last['model'] : 'llama3.1:8b'
+EXECUTOR_MODEL = sorted_thinking.last ? sorted_thinking.last['model'] : 'qwen3-vl:latest'
 
 THINKING_MODEL_NAMES = THINKING_MODELS.map { |m| m['model'] }
 MAX_STEPS = 20
@@ -219,19 +224,37 @@ def plan_next_step(client, goal, observations, model: PLANNER_MODEL)
 
   response = client.chat(model: model, **options)
 
-  # reasoning is in res.message.thinking for some versions/models
+  # Reasoning is in res.message.thinking for some versions/models
   thinking = response.message.respond_to?(:thinking) ? response.message.thinking : nil
 
   # The small model might just return a string or truncated JSON
   content = response.message.content.to_s.strip
-  plan = content.start_with?('{') ? JSON.parse(content) : { 'action' => 'respond' }
+
+  begin
+    plan = content.start_with?('{') ? JSON.parse(content) : { 'action' => 'respond' }
+
+    # Validation: If the model provides tool arguments but set action to 'respond',
+    # it likely meant to call a tool.
+    if plan['action'] == 'respond' && plan['tool_arguments'] && !plan['tool_arguments'].empty?
+      plan['action'] = 'tool'
+    end
+
+    # Fallback for tool_name if missing but arguments exist
+    if plan['action'] == 'tool' && (plan['tool_name'].nil? || plan['tool_name'].empty?)
+      if plan['tool_arguments']&.key?('path')
+        plan['tool_name'] = 'read_file'
+      elsif plan['tool_arguments']&.key?('expression')
+        plan['tool_name'] = 'calculate'
+      end
+    end
+  rescue JSON::ParserError
+    plan = { 'action' => 'respond' }
+  end
 
   {
     plan: plan,
     reasoning: thinking
   }
-rescue JSON::ParserError
-  { plan: { 'action' => 'respond' }, reasoning: nil }
 end
 
 # ---------------------------
